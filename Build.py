@@ -190,6 +190,21 @@ def check_percentage_missing(model, tolerance):
             assert (abs(zero_ratio - el) < tolerance)
 
 
+def check_ratio_of_zeros(tolerance, model):
+    for idx, layer in enumerate(model.layers):
+        if (idx != 0) and (idx != len(model.layers) - 1):
+            num_non_zeros = 0.0
+            layer_weights = layer.get_weights()
+            weights_matrix = layer_weights[0]
+            n_rows, n_cols = np.shape(weights_matrix)
+            for i in range(0, n_rows):
+                for j in range(0, n_cols):
+                    if (weights_matrix[i][j] == 0.0):
+                        num_non_zeros = num_non_zeros + 1
+            zero_ratio = num_non_zeros / (float(n_rows) * float(n_cols))
+            assert (abs(zero_ratio - el) < tolerance)
+
+
 if __name__ == '__main__':
     (train_images, train_labels), (test_images, test_labels) = read_data()
     train_labels = to_categorical(train_labels)
@@ -198,7 +213,7 @@ if __name__ == '__main__':
         train_images, train_labels, stratify=None, test_size=0.1, random_state=0)
     model = keras.Sequential([
         keras.layers.Flatten(input_shape=(28, 28)),
-        keras.layers.Dense(1000, activation='relu'),
+        keras.layers.Dense(100, activation='relu'),
         keras.layers.Dense(1000, activation='relu'),
         keras.layers.Dense(500, activation='relu'),
         keras.layers.Dense(200, activation='relu'),
@@ -220,21 +235,8 @@ if __name__ == '__main__':
         model = weight_pruner.prune_and_fine_tune(model, el, 1, x_train, y_train, x_validation, y_validation)
         test_loss, test_acc2 = model.evaluate(test_images, test_labels)
         print('\nTest accuracy:', test_acc2)
-        for idx, layer in enumerate(model.layers):
-            if (idx != 0) and (idx != len(model.layers)-1):
-                num_non_zeros = 0.0
-                layer_weights = layer.get_weights()
-                weights_matrix = layer_weights[0]
-                n_rows, n_cols = np.shape(weights_matrix)
-                for i in range(0, n_rows):
-                    for j in range(0,n_cols):
-                        if (weights_matrix[i][j] == 0.0):
-                            num_non_zeros = num_non_zeros + 1
-                zero_ratio = num_non_zeros / (float(n_rows) * float(n_cols))
-                print("el is " + str(el))
-                print(str(abs(zero_ratio - el)))
-                assert(abs(zero_ratio - el) < 0.04)
         test_accuracy_list.append(test_acc2)
+        check_ratio_of_zeros(0.04, model)
 
     print(test_accuracy_list)
     pruning_amounts = [0.0, 0.25, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.97, 0.99]
