@@ -9,17 +9,6 @@ import heapq
 
 class Model:
 
-    def fine_tune(self, model, train_data, train_labels, validation_data=None, validation_labels=None,
-              hyper_param_search_method=''):
-        if validation_data is not None and validation_labels is not None:
-            x_train, x_validation, y_train, y_validation = (train_data, validation_data, train_labels, validation_labels)
-        else:
-            x_train, x_validation, y_train, y_validation = train_test_split(
-                train_images, train_labels, stratify=None, test_size=0.1, random_state=0)
-
-        model.fit(x_train, y_train, validation_data=[x_validation, y_validation],
-                  epochs=20, callbacks=[EarlyStopping(patience=20)])
-
     def train(self, model, train_data, train_labels, validation_data=None, validation_labels=None):
 
         if validation_data is not None and validation_labels is not None:
@@ -174,20 +163,6 @@ def read_data():
 
     (train_images, train_labels), (test_images, test_labels) = fashion_mnist.load_data()
     return (train_images, train_labels), (test_images, test_labels)
-
-def check_percentage_missing(model, tolerance):
-    for idx, layer in enumerate(model.layers):
-        if (idx != 0) and (idx != len(model.layers) - 1):
-            num_non_zeros = 0.0
-            layer_weights = layer.get_weights()
-            weights_matrix = layer_weights[0]
-            n_rows, n_cols = np.shape(weights_matrix)
-            for i in range(0, n_rows):
-                for j in range(0, n_cols):
-                    if (weights_matrix[i][j] == 0.0):
-                        num_non_zeros = num_non_zeros + 1
-            zero_ratio = num_non_zeros / (float(n_rows) * float(n_cols))
-            assert (abs(zero_ratio - el) < tolerance)
 
 
 def check_ratio_of_zeros(tolerance, model):
