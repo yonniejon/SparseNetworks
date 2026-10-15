@@ -1,217 +1,234 @@
-import pandas as pd
-from tensorflow import keras
+"""
+Magnitude-based pruning of a dense Fashion-MNIST classifier.
+
+Trains a baseline network, then for each sparsity level k prunes every hidden
+Dense layer (the output layer is never pruned), optionally fine-tunes, and
+reports test accuracy.
+
+    python Build.py                        # weight pruning (default)
+    python Build.py --method unit          # unit (neuron) pruning
+    python Build.py --fine-tune-epochs 0   # prune only, no fine-tuning
+    python Build.py --no-mask              # let pruned weights regrow while fine-tuning, then re-prune
+    python Build.py --independent          # prune each k from the baseline, not from the previous k
+"""
+import argparse
+
 import numpy as np
-import matplotlib.pyplot as plt
+import tensorflow as tf
 from sklearn.model_selection import train_test_split
-from tensorflow.python.keras.callbacks import EarlyStopping
-from keras.utils import to_categorical
-import heapq
 
-class Model:
+keras = tf.keras
 
-    def train(self, model, train_data, train_labels, validation_data=None, validation_labels=None):
+# Hidden layer sizes. The first layer is 100 units, as in the original code;
+# change it here if your spec calls for something else (e.g. 1000).
+HIDDEN_SIZES = [100, 1000, 500, 200]
+NUM_CLASSES = 10
+PRUNING_AMOUNTS = [0.25, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.97, 0.99]
 
-        if validation_data is not None and validation_labels is not None:
-            x_train, x_validation, y_train, y_validation = (train_data, validation_data, train_labels, validation_labels)
-        else:
-            x_train, x_validation, y_train, y_validation = train_test_split(
-                train_images, train_labels, stratify=None, test_size=0.1, random_state=0)
 
-        model.fit(x_train, y_train, validation_data=[x_validation, y_validation],
-                  epochs=10, callbacks=[EarlyStopping(patience=5)])
-        return model
+# --------------------------------------------------------------------------- #
+# Pruning
+# --------------------------------------------------------------------------- #
 
-class Point:
-    def __init__(self, i, j, entry_value):
-        self.i = i
-        self.j = j
-        self.value = entry_value
+def prunable_layers(model):
+    """Every Dense layer except the final (output) layer."""
+    dense_layers = [layer for layer in model.layers if isinstance(layer, keras.layers.Dense)]
+    return dense_layers[:-1]
 
-    def __lt__(self, other):
-        if not isinstance(other, Point):
-            raise TypeError(f"Argument save must be of type Point, not {type(other)}")
 
-        return abs(self.value) < abs(other.value)
+class Pruner:
+    """
+    Base class. Subclasses implement `layer_masks`, which returns boolean
+    "keep" masks for a layer's kernel and bias (False = pruned).
+    """
 
-class Column:
-    def __init__(self, i, entry_value):
-        self.index = i
-        self.value = entry_value
-
-    def __lt__(self, other):
-        if not isinstance(other, Column):
-            raise TypeError(f"Argument save must be of type Column, not {type(other)}")
-
-        return abs(self.value) < abs(other.value)
-
-class UnitPruning:
-    def compute_rank(self, weights_matrix):
-        ordered_cols = []
-        n_rows, n_cols = np.shape(weights_matrix)
-        for j in range(0, n_cols):
-            col_sum = 0
-            for i in range(0, n_rows):
-                col_sum = col_sum + (weights_matrix[i][j] ** 2)
-
-            l2_norm = col_sum ** (1/2)
-            cur_col = Column(j, l2_norm)
-            heapq.heappush(ordered_cols, cur_col)
-        return ordered_cols
-
-    def prune_matrix(self, weights_matrix, k):
-        """
-               Parameters
-               ----------
-               weights_matrix : np.array
-                   The weights matrix of some layer in the network
-               k : float in [0, 1]
-                   represents the percentage of weights to remove
-        """
-        ordered_cols = self.compute_rank(weights_matrix)
-        n_rows, n_cols = np.shape(weights_matrix)
-        to_remove = int(k * n_cols)
-        new_weights = weights_matrix
-        for j in range(0, to_remove):
-            cur_col = ordered_cols[j]
-            for i in range(0, n_rows):
-                new_weights[i][cur_col.index] = 0.0
-        return new_weights
+    def layer_masks(self, kernel, bias, k):
+        raise NotImplementedError
 
     def prune(self, model, k):
         """
-               Parameters
-               ----------
-               model : keras.Model
-                   The model from which to prune weights
-               k : float in [0, 1]
-                   represents the percentage of weights to remove
+        Prune `model` in place.
+
+        Parameters
+        ----------
+        model : keras.Model
+            The model whose hidden Dense layers are pruned.
+        k : float in [0, 1]
+            Fraction of each layer's weights (or units) to remove.
+
+        Returns
+        -------
+        list of (layer, kernel_keep, bias_keep)
+            The masks that were applied, for use with `MaskWeights`.
         """
-        for idx, layer in enumerate(model.layers):
-            if (idx != 0) and (idx != len(model.layers)-1):
-                layer_weights = layer.get_weights()
-                weights_matrix = layer_weights[0] #take weight matrix and not biases
-                new_weights = self.prune_matrix(weights_matrix, k)
-                layer_weights[0] = new_weights
-                layer.set_weights(layer_weights)
-        return model
+        masks = []
+        for layer in prunable_layers(model):
+            kernel, bias = layer.get_weights()
+            kernel_keep, bias_keep = self.layer_masks(kernel, bias, k)
+            layer.set_weights([kernel * kernel_keep, bias * bias_keep])
+            masks.append((layer, kernel_keep, bias_keep))
+        return masks
 
-    def prune_and_fine_tune(self, model, k, num_rounds, train_data, train_labels, validation_data=None, validation_labels=None):
-        model_trainer = Model()
-        model = weight_pruner.prune(model, k)
-        model = model_trainer.train(model, train_data, train_labels, validation_data, validation_labels)
-        model = weight_pruner.prune(model, k)
 
-        return model
+class WeightPruning(Pruner):
+    """Zero the fraction k of individual weights with the smallest |w| in each kernel."""
 
-class WeightPruning:
-    def compute_rank(self, weights_matrix):
-        ordered_indices = []
-        n_rows, n_cols = np.shape(weights_matrix)
-        for i in range(0, n_rows):
-            for j in range(0, n_cols):
-                cur_point = Point(i, j, weights_matrix[i][j])
-                heapq.heappush(ordered_indices, cur_point)
-        return ordered_indices
+    def layer_masks(self, kernel, bias, k):
+        n_prune = int(k * kernel.size)
+        smallest = np.argsort(np.abs(kernel), axis=None, kind="stable")[:n_prune]
+        kernel_keep = np.ones(kernel.size, dtype=bool)
+        kernel_keep[smallest] = False
+        return kernel_keep.reshape(kernel.shape), np.ones(bias.shape, dtype=bool)
 
-    def prune_matrix(self, weights_matrix, k):
-        """
-               Parameters
-               ----------
-               weights_matrix : np.array
-                   The weights matrix of some layer in the network
-               k : float in [0, 1]
-                   represents the percentage of weights to remove
-        """
-        ordered_weights = self.compute_rank(weights_matrix)
-        n_rows, n_cols = np.shape(weights_matrix)
-        to_remove = int(k * n_rows * n_cols)
-        new_weights = weights_matrix
-        for i in range(0, to_remove):
-            cur_point = ordered_weights[i]
-            new_weights[cur_point.i][cur_point.j] = 0.0
-        return new_weights
 
-    def prune(self, model, k):
-        """
-               Parameters
-               ----------
-               model : keras.Model
-                   The model from which to prune weights
-               k : float in [0, 1]
-                   represents the percentage of weights to remove
-        """
-        for idx, layer in enumerate(model.layers):
-            if (idx != 0) and (idx != len(model.layers)-1):
-                layer_weights = layer.get_weights()
-                weights_matrix = layer_weights[0] #take weight matrix and not biases
-                new_weights = self.prune_matrix(weights_matrix, k)
-                layer_weights[0] = new_weights
-                layer.set_weights(layer_weights)
-        return model
+class UnitPruning(Pruner):
+    """
+    Zero the fraction k of units with the smallest L2 norm. A unit is a column
+    of the kernel (all weights feeding into one neuron); its bias is zeroed too,
+    so the pruned neuron outputs 0 instead of a constant relu(bias).
+    """
 
-    def prune_and_fine_tune(self, model, k, num_rounds, train_data, train_labels, validation_data=None, validation_labels=None):
-        model_trainer = Model()
-        model = weight_pruner.prune(model, k)
-        model = model_trainer.train(model, train_data, train_labels, validation_data, validation_labels)
-        model = weight_pruner.prune(model, k)
+    def layer_masks(self, kernel, bias, k):
+        n_rows, n_cols = kernel.shape
+        n_prune = int(k * n_cols)
+        weakest = np.argsort(np.linalg.norm(kernel, axis=0), kind="stable")[:n_prune]
+        unit_keep = np.ones(n_cols, dtype=bool)
+        unit_keep[weakest] = False
+        kernel_keep = np.broadcast_to(unit_keep, (n_rows, n_cols)).copy()
+        return kernel_keep, unit_keep
 
-        return model
 
+class MaskWeights(keras.callbacks.Callback):
+    """Re-zero pruned weights after every training batch so they stay pruned while fine-tuning."""
+
+    def __init__(self, masks):
+        super().__init__()
+        self.pairs = []
+        for layer, kernel_keep, bias_keep in masks:
+            self.pairs.append((layer.kernel, tf.constant(kernel_keep, dtype=layer.kernel.dtype)))
+            self.pairs.append((layer.bias, tf.constant(bias_keep, dtype=layer.bias.dtype)))
+
+    def on_train_batch_end(self, batch, logs=None):
+        for variable, keep in self.pairs:
+            variable.assign(variable * keep)
+
+
+def check_sparsity(model, k, tolerance=0.04):
+    """Check that each pruned layer's kernel has a fraction of zeros close to k."""
+    for layer in prunable_layers(model):
+        kernel = layer.get_weights()[0]
+        zero_ratio = float(np.mean(kernel == 0.0))
+        if abs(zero_ratio - k) >= tolerance:
+            raise RuntimeError(f"{layer.name}: {zero_ratio:.3f} of weights are zero, expected about {k}")
+
+
+# --------------------------------------------------------------------------- #
+# Data, model and training
+# --------------------------------------------------------------------------- #
 
 def read_data():
-    fashion_mnist = keras.datasets.fashion_mnist
-
-    (train_images, train_labels), (test_images, test_labels) = fashion_mnist.load_data()
-    return (train_images, train_labels), (test_images, test_labels)
-
-
-def check_ratio_of_zeros(tolerance, model):
-    for idx, layer in enumerate(model.layers):
-        if (idx != 0) and (idx != len(model.layers) - 1):
-            num_non_zeros = 0.0
-            layer_weights = layer.get_weights()
-            weights_matrix = layer_weights[0]
-            n_rows, n_cols = np.shape(weights_matrix)
-            for i in range(0, n_rows):
-                for j in range(0, n_cols):
-                    if (weights_matrix[i][j] == 0.0):
-                        num_non_zeros = num_non_zeros + 1
-            zero_ratio = num_non_zeros / (float(n_rows) * float(n_cols))
-            assert (abs(zero_ratio - el) < tolerance)
+    (x_train, y_train), (x_test, y_test) = keras.datasets.fashion_mnist.load_data()
+    x_train = x_train.astype("float32") / 255.0
+    x_test = x_test.astype("float32") / 255.0
+    y_train = keras.utils.to_categorical(y_train, NUM_CLASSES)
+    y_test = keras.utils.to_categorical(y_test, NUM_CLASSES)
+    return (x_train, y_train), (x_test, y_test)
 
 
-if __name__ == '__main__':
+def compile_model(model):
+    model.compile(optimizer="adam", loss="categorical_crossentropy", metrics=["accuracy"])
+
+
+def build_model():
+    model = keras.Sequential(
+        [keras.Input(shape=(28, 28)), keras.layers.Flatten()]
+        + [keras.layers.Dense(units, activation="relu") for units in HIDDEN_SIZES]
+        + [keras.layers.Dense(NUM_CLASSES, activation="softmax")]
+    )
+    compile_model(model)
+    return model
+
+
+def train(model, train_data, validation_data, epochs, patience, extra_callbacks=()):
+    x_train, y_train = train_data
+    early_stopping = keras.callbacks.EarlyStopping(patience=patience, restore_best_weights=True)
+    model.fit(
+        x_train,
+        y_train,
+        validation_data=validation_data,
+        epochs=epochs,
+        callbacks=[*extra_callbacks, early_stopping],
+        verbose=2,
+    )
+    return model
+
+
+def prune_and_fine_tune(pruner, model, k, train_data, validation_data, fine_tune_epochs, keep_mask=True):
+    masks = pruner.prune(model, k)
+    if fine_tune_epochs > 0:
+        if keep_mask:
+            train(model, train_data, validation_data, fine_tune_epochs, patience=5,
+                  extra_callbacks=[MaskWeights(masks)])
+        else:
+            # Pruned weights grow back during unmasked fine-tuning, so prune again before evaluating.
+            train(model, train_data, validation_data, fine_tune_epochs, patience=5)
+            pruner.prune(model, k)
+    return model
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--method", choices=["weight", "unit"], default="weight",
+                        help="weight pruning or unit (neuron) pruning (default: weight)")
+    parser.add_argument("--epochs", type=int, default=100, help="max epochs for the baseline (default: 100)")
+    parser.add_argument("--fine-tune-epochs", type=int, default=10,
+                        help="max fine-tuning epochs after each prune; 0 disables fine-tuning (default: 10)")
+    parser.add_argument("--no-mask", action="store_true",
+                        help="let pruned weights regrow during fine-tuning and prune again afterwards")
+    parser.add_argument("--independent", action="store_true",
+                        help="prune each level from the trained baseline instead of from the previous level")
+    parser.add_argument("--seed", type=int, default=0, help="random seed (default: 0)")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    keras.utils.set_random_seed(args.seed)
+
     (train_images, train_labels), (test_images, test_labels) = read_data()
-    train_labels = to_categorical(train_labels)
-    test_labels = to_categorical(test_labels)
     x_train, x_validation, y_train, y_validation = train_test_split(
-        train_images, train_labels, stratify=None, test_size=0.1, random_state=0)
-    model = keras.Sequential([
-        keras.layers.Flatten(input_shape=(28, 28)),
-        keras.layers.Dense(100, activation='relu'),
-        keras.layers.Dense(1000, activation='relu'),
-        keras.layers.Dense(500, activation='relu'),
-        keras.layers.Dense(200, activation='relu'),
-        keras.layers.Dense(10, activation='softmax')
-    ])
-    model.compile(optimizer='adam',
-                  loss='categorical_crossentropy',
-                  metrics=['accuracy'])
-    model.fit(x_train, y_train, validation_data= [x_validation, y_validation],
-              epochs=100, callbacks=[EarlyStopping(patience=20)])
-    test_loss, test_acc1 = model.evaluate(test_images, test_labels)
-    print('\nTest accuracy:', test_acc1)
-    weight_pruner = WeightPruning()
+        train_images, train_labels, test_size=0.1, random_state=args.seed)
+    train_data = (x_train, y_train)
+    validation_data = (x_validation, y_validation)
 
-    pruning_amounts = [0.25, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.97, 0.99]
-    test_accuracy_list = []
-    test_accuracy_list.append(test_acc1)
-    for el in pruning_amounts:
-        model = weight_pruner.prune_and_fine_tune(model, el, 1, x_train, y_train, x_validation, y_validation)
-        test_loss, test_acc2 = model.evaluate(test_images, test_labels)
-        print('\nTest accuracy:', test_acc2)
-        test_accuracy_list.append(test_acc2)
-        check_ratio_of_zeros(0.04, model)
+    model = build_model()
+    train(model, train_data, validation_data, args.epochs, patience=20)
+    _, baseline_accuracy = model.evaluate(test_images, test_labels, verbose=0)
+    print(f"\nBaseline test accuracy: {baseline_accuracy:.4f}")
+    baseline_weights = model.get_weights()
 
-    print(test_accuracy_list)
-    pruning_amounts = [0.0, 0.25, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.97, 0.99]
+    pruner = UnitPruning() if args.method == "unit" else WeightPruning()
+    results = [(0.0, baseline_accuracy)]
+    for k in PRUNING_AMOUNTS:
+        if args.independent:
+            model.set_weights(baseline_weights)
+            compile_model(model)  # fresh optimizer state for each level
+        prune_and_fine_tune(pruner, model, k, train_data, validation_data,
+                            args.fine_tune_epochs, keep_mask=not args.no_mask)
+        check_sparsity(model, k)
+        _, accuracy = model.evaluate(test_images, test_labels, verbose=0)
+        print(f"\nk = {k:.2f}  test accuracy: {accuracy:.4f}")
+        results.append((k, accuracy))
+
+    print(f"\n{args.method} pruning")
+    print("k      test accuracy")
+    for k, accuracy in results:
+        print(f"{k:<6.2f} {accuracy:.4f}")
+
+
+if __name__ == "__main__":
+    main()
